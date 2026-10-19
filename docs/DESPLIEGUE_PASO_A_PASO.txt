@@ -1,0 +1,176 @@
+=====================================================================
+  FORJA API (Node.js + Express) - DESPLIEGUE PASO A PASO EN OCI
+  VM: 40.233.4.248 | Usuario: ubuntu | Llave: C:\ssh-keys\ssh-key-2026-09-27.key
+=====================================================================
+
+  [PC]     = en tu computadora (terminal de VS Code o PowerShell)
+  [VM]     = dentro del servidor por SSH
+  La app web Laravel NO se modifica: la API vive en /var/www/forja-api
+  y Nginx solo reenvía a Node lo que empieza con /api/.
+
+  Resultado final:
+    http://40.233.4.248/api/v1/productos  -> API (Node, puerto interno 3000)
+    http://40.233.4.248/                  -> App web Laravel (igual que antes)
+
+
+---------------------------------------------------------------------
+PASO 1. SUBIR EL PROYECTO A GITHUB  [PC]
+---------------------------------------------------------------------
+1) En github.com: New repository
+     Nombre: forja-api   |  Public  |  SIN README, SIN .gitignore (ya vienen en el proyecto)
+2) En VS Code: File > Open Folder > C:\Users\danie\IdeaProjects\forja-api
+3) Terminal de VS Code (Ctrl + ñ):
+
+git init
+git add .
+git commit -m "API RESTful de productos - Forja Athletics"
+git branch -M main
+git remote add origin https://github.com/TU_USUARIO/forja-api.git
+git push -u origin main
+
+# Revisa en GitHub que NO aparezca un archivo .env (solo .env.example).
+# Si git pide identificarse la primera vez:
+#   git config --global user.name "Iván Daniel García García"
+#   git config --global user.email "tu_correo@ejemplo.com"
+
+
+---------------------------------------------------------------------
+PASO 2. INSTALAR NODE.JS 22 Y PM2  [VM]
+---------------------------------------------------------------------
+ssh -i .\ssh-key-2026-09-27.key ubuntu@40.233.4.248      # (desde C:\ssh-keys)
+
+curl -fsSL https://deb.nodesource.com/setup_22.x -o nodesource_setup.sh
+sudo -E bash nodesource_setup.sh
+sudo apt install -y nodejs
+node -v          # v22.x
+npm -v
+
+sudo npm install -g pm2
+pm2 -v
+
+
+---------------------------------------------------------------------
+PASO 3. DESCARGAR EL PROYECTO EN LA VM  [VM]
+---------------------------------------------------------------------
+sudo mkdir -p /var/www/forja-api
+sudo chown ubuntu:ubuntu /var/www/forja-api
+git clone https://github.com/TU_USUARIO/forja-api.git /var/www/forja-api
+cd /var/www/forja-api
+npm install --omit=dev
+ls
+
+
+---------------------------------------------------------------------
+PASO 4. CREAR EL USUARIO DE MYSQL app_api  [VM]
+---------------------------------------------------------------------
+sed "s/CAMBIAR_PASSWORD/TU_PASSWORD_API/" /var/www/forja-api/sql/app_api.sql | sudo mysql
+
+# (el script del repositorio tiene CAMBIAR_PASSWORD; sed pone la contraseña real
+#  solo al ejecutarlo, así no queda publicada en GitHub)
+
+# Debe mostrar:
+#   GRANT SELECT ON `forja_athletics`.`categoria` TO `app_api`@`localhost`
+#   GRANT SELECT, INSERT, UPDATE, DELETE ON `forja_athletics`.`producto` TO `app_api`@`localhost`
+# (CAPTURA)
+
+# Prueba rápida del usuario (contraseña: TU_PASSWORD_API):
+mysql -u app_api -p forja_athletics -e "SELECT COUNT(*) AS productos FROM producto;"
+
+
+---------------------------------------------------------------------
+PASO 5. CONFIGURAR EL ARCHIVO .env  [VM]
+---------------------------------------------------------------------
+cd /var/www/forja-api
+cp .env.example .env
+sed -i 's|^DB_PASSWORD=.*|DB_PASSWORD="TU_PASSWORD_API"|' .env
+sed -i 's|^NODE_ENV=.*|NODE_ENV=production|' .env
+chmod 600 .env
+cat .env
+
+# La contraseña va entre comillas porque contiene #.
+
+
+---------------------------------------------------------------------
+PASO 6. ARRANCAR LA API CON PM2  [VM]
+---------------------------------------------------------------------
+cd /var/www/forja-api
+pm2 start ecosystem.config.js
+pm2 status                                   # forja-api -> online
+pm2 logs forja-api --lines 20 --nostream     # "Forja API escuchando en http://127.0.0.1:3000/api/v1"
+
+# Prueba local (todavía sin Nginx):
+curl -s http://127.0.0.1:3000/api/v1/productos | head -c 400; echo
+
+# Que arranque sola si se reinicia la VM:
+pm2 startup systemd
+#   -> IMPRIME un comando que empieza con "sudo env PATH=..." : CÓPIALO Y EJECÚTALO
+pm2 save
+
+
+---------------------------------------------------------------------
+PASO 7. PUBLICAR LA API EN EL PUERTO 80 CON NGINX  [VM]
+---------------------------------------------------------------------
+# Respaldo de la configuración actual
+sudo cp /etc/nginx/sites-available/forja /etc/nginx/sites-available/forja.bak
+
+# Insertar el bloque /api/ antes de "location / {" (solo si no existe ya)
+grep -q "location ^~ /api/" /etc/nginx/sites-available/forja || sudo sed -i '/^    location \/ {/i\    location ^~ /api/ {\n        proxy_pass http://127.0.0.1:3000;\n        proxy_http_version 1.1;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n' /etc/nginx/sites-available/forja
+
+# Revisar que quedó bien
+sudo grep -n -A8 "location ^~ /api/" /etc/nginx/sites-available/forja
+
+sudo nginx -t                    # debe decir "syntax is ok" y "test is successful"
+sudo systemctl reload nginx
+
+# Si nginx -t marca error, regresar al respaldo:
+#   sudo cp /etc/nginx/sites-available/forja.bak /etc/nginx/sites-available/forja
+#   sudo nginx -t && sudo systemctl reload nginx
+
+# Comprobar las DOS aplicaciones:
+curl -i http://localhost/api/v1/productos | head -n 15     # API -> HTTP/1.1 200 OK + JSON
+curl -I http://localhost/login                             # Laravel -> HTTP/1.1 200 OK
+
+# No hay que abrir puertos nuevos: el 3000 es interno y el 80 ya estaba abierto.
+
+
+---------------------------------------------------------------------
+PASO 8. PROBAR DESDE TU PC (Postman o Thunder Client)  [PC]
+---------------------------------------------------------------------
+Navegador:  http://40.233.4.248/api/v1/productos   (debe verse el JSON)
+
+Postman:        Import > docs/forja-api.postman_collection.json
+Thunder Client: (VS Code) icono del rayo > Collections > menú ≡ > Import > el mismo archivo
+
+Ejecutar EN ORDEN la carpeta "Endpoints":
+  1. GET  listar           -> 200
+  2. GET  por id (1)       -> 200
+  3. POST crear            -> 201 (guarda el id creado en producto_nuevo_id)
+  4. PUT  actualizar       -> 200
+  5. DELETE eliminar       -> 200
+Después la carpeta "Pruebas de errores" (400, 404, 409).
+
+CAPTURAS (una por endpoint) donde se vea: método + URL completa,
+body JSON (en POST y PUT), código HTTP y respuesta JSON.
+
+Colección para entregar: en Postman, clic derecho en la colección >
+Export > Collection v2.1 (o entregar directamente docs/forja-api.postman_collection.json).
+
+
+---------------------------------------------------------------------
+ACTUALIZAR LA API DESPUÉS DE UN CAMBIO
+---------------------------------------------------------------------
+[PC]  git add . && git commit -m "mensaje" && git push
+[VM]  cd /var/www/forja-api && git pull && npm install --omit=dev && pm2 restart forja-api
+
+
+---------------------------------------------------------------------
+SI ALGO FALLA
+---------------------------------------------------------------------
+pm2 logs forja-api --lines 50 --nostream     # errores de la API
+pm2 restart forja-api
+sudo tail -n 30 /var/log/nginx/error.log     # errores de Nginx
+
+- 502 Bad Gateway en /api/...  -> la API no está corriendo: pm2 status / pm2 logs
+- "Access denied for user 'app_api'" -> revisar DB_PASSWORD en .env (con comillas) y el Paso 4
+- "SELECT command denied ... table 'X'" -> la API intentó usar una tabla sin permiso
+- La app Laravel dejó de cargar -> restaurar forja.bak (Paso 7)
